@@ -71,6 +71,9 @@ final class Agents: ObservableObject {
         /// by its path may go up from a task kept to the browser
         /// (AgentFiles.refuse, feedback #141).
         var told: [String] = []
+        /// The next message carries on a thread the person stopped: the agent
+        /// is told so once, apart from the words kept as the prompt (#964).
+        var afterStop = false
         var state: State
         /// Tabs the person released from this attached session. A later call cannot reclaim them.
         var stoppedTabs: Set<UUID> = []
@@ -1014,6 +1017,8 @@ final class Agents: ObservableObject {
         if let earlier, earlier.cli == cli, !earlier.state.live {
             session = earlier
             session.prompt = prompt
+            // Its thread ends inside what the person stopped (#964).
+            session.afterStop = earlier.state == .stopped
             session.state = .starting
             session.result = ""
             session.ended = nil
@@ -1869,6 +1874,8 @@ final class Agents: ObservableObject {
             }
             return
         }
+        let message = Agents.said(message, afterStop: session.afterStop)
+        session.afterStop = false
         if session.agent == .gemini { return gemini(session, message: message) }
         let process = Process()
         session.archiveError = nil
@@ -3008,6 +3015,20 @@ final class Agents: ObservableObject {
         return session
     }
 
+    /// Said before the words of a message that carries on a stopped turn
+    /// (#964): its thread ends inside the work the person stopped, and an
+    /// agent left to read it carried on with that.
+    static let stoppedLine = """
+    The person stopped you in your last turn. Don't resume or retry what it was doing, a sign-in handoff \
+    included; do only what this message asks.
+
+    """
+
+    /// The message as the agent gets it: after a stop, the note first.
+    static func said(_ message: String, afterStop: Bool) -> String {
+        afterStop ? stoppedLine + message : message
+    }
+
     func stop(_ id: String) -> Bool {
         guard let session = session(id), session.state.live else { return false }
         session.turnPermit.revoke()
@@ -3027,7 +3048,7 @@ final class Agents: ObservableObject {
             tab.permit = nil
             tab.handoff = nil
         }
-        for tab in tabs(of: session) where tab.handoff != nil {
+        for tab in windowTabs where tab.agent == session.id && tab.handoff != nil {
             tab.handoff = nil
             Agents.optional.remove(tab.id)
         }
@@ -3077,7 +3098,7 @@ final class Agents: ObservableObject {
         if session.state == .done { tallyForWrapped(session) }
         // What it asked and never heard back on goes with it: an answer
         // now would reach no one, and the page's foot would still ask.
-        for tab in tabs(of: session) where tab.handoff != nil && tab.permit == nil {
+        for tab in windowTabs where tab.agent == session.id && tab.handoff != nil && tab.permit == nil {
             tab.handoff = nil
             tab.handoffDetail = nil
             tab.choices = []
