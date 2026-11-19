@@ -72,7 +72,9 @@ final class Agents: ObservableObject {
         /// (AgentFiles.refuse, feedback #141).
         var told: [String] = []
         /// The next message carries on a thread the person stopped: the agent
-        /// is told so once, apart from the words kept as the prompt (#964).
+        /// is told so once, apart from the words kept as the prompt. Pending
+        /// until a message is handed to the provider (Agents.delivered), so
+        /// a launch that fails does not spend it (#964).
         var afterStop = false
         var state: State
         /// Tabs the person released from this attached session. A later call cannot reclaim them.
@@ -652,7 +654,7 @@ final class Agents: ObservableObject {
             session.resent -= 1
             return
         }
-        let words = session.saying.isEmpty ? text : session.saying.removeFirst()
+        let words = session.saying.isEmpty ? Agents.unsaid(text) : session.saying.removeFirst()
         var item = ChatItem(id: UUID().uuidString, kind: .asked, text: words, state: .done)
         if !session.carrying.isEmpty { item.detail = session.carrying.removeFirst().joined(separator: "\n") }
         if !session.attaching.isEmpty { session.sent[item.id] = session.attaching.removeFirst() }
@@ -1017,8 +1019,9 @@ final class Agents: ObservableObject {
         if let earlier, earlier.cli == cli, !earlier.state.live {
             session = earlier
             session.prompt = prompt
-            // Its thread ends inside what the person stopped (#964).
-            session.afterStop = earlier.state == .stopped
+            // Its thread ends inside what the person stopped (#964). A note
+            // a failed launch never delivered stays owed, not overwritten.
+            session.afterStop = session.afterStop || earlier.state == .stopped
             session.state = .starting
             session.result = ""
             session.ended = nil
@@ -1466,6 +1469,7 @@ final class Agents: ObservableObject {
             geminiRunners[session.id] = runner
             session.process = runner.child
             try runner.send(message)
+            delivered(session)
             // One message a turn: the CLI ends after its result.
             runner.close()
         } catch {
@@ -1874,8 +1878,8 @@ final class Agents: ObservableObject {
             }
             return
         }
+        // Only said here; it is owed until delivered() (#964).
         let message = Agents.said(message, afterStop: session.afterStop)
-        session.afterStop = false
         if session.agent == .gemini { return gemini(session, message: message) }
         let process = Process()
         session.archiveError = nil
@@ -2051,6 +2055,9 @@ final class Agents: ObservableObject {
                 }
                 send(session, session.agent == .cursor && session.thread == nil ? brief + "\n\n" + message : message)
             }
+            // Written to its stdin or the server above; a Codex exec has
+            // it in its arguments, handed over by the launch (#964).
+            delivered(session)
             if !session.remembering {
                 session.state = .running
                 note(session, "\(session.name) is working")
@@ -3024,6 +3031,19 @@ final class Agents: ObservableObject {
 
     """
 
+    /// The person's words of a message as the agent got it: the chat shows
+    /// no note (#964).
+    static func unsaid(_ text: String) -> String {
+        text.hasPrefix(stoppedLine) ? String(text.dropFirst(stoppedLine.count)) : text
+    }
+
+    /// A message has reached the provider (written to its stdin or server,
+    /// or its process launched with it): the stop note is spent. Before
+    /// this, a launch that throws leaves it owed to the next message (#964).
+    func delivered(_ session: Session) {
+        session.afterStop = false
+    }
+
     /// The message as the agent gets it: after a stop, the note first.
     static func said(_ message: String, afterStop: Bool) -> String {
         afterStop ? stoppedLine + message : message
@@ -3588,7 +3608,7 @@ final class Agents: ObservableObject {
                     continue
                 }
                 // What it was told, said back: in your words.
-                if item.kind == .asked, !session.saying.isEmpty { item.text = session.saying.removeFirst() }
+                if item.kind == .asked { item.text = session.saying.isEmpty ? Agents.unsaid(item.text) : session.saying.removeFirst() }
                 if item.kind == .asked, !session.carrying.isEmpty { item.detail = session.carrying.removeFirst().joined(separator: "\n") }
                 if item.kind == .asked, !session.attaching.isEmpty { session.sent[item.id] = session.attaching.removeFirst() }
                 if item.kind == .asked, session.steering > 0 { item.name = "steer"; session.steering -= 1 }

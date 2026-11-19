@@ -147,6 +147,129 @@ struct AgentDockStopTests {
         #expect(sent.hasPrefix(Agents.stoppedLine))
         #expect(sent.contains("Don't resume or retry"))
         #expect(sent.hasSuffix("no, from the page I'm on"))
+        #expect(Agents.unsaid(sent) == "no, from the page I'm on")
+    }
+
+    /// A stand-in Claude Code: logs each line it is written, answers, stays up.
+    private func stand(in root: URL) throws -> URL {
+        let binary = root.appendingPathComponent("claude-stub")
+        try #"""
+        #!/usr/bin/python3
+        import json, os, sys
+        print(json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 'stub'}), flush=True)
+        for line in sys.stdin:
+            message = json.loads(line)
+            text = ''.join(part['text'] for part in message['message']['content'])
+            with open(os.environ['STUB_LOG'], 'a') as output:
+                output.write(json.dumps(text) + '\n')
+            print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'session_id': 'stub', 'result': 'ok', 'num_turns': 1}), flush=True)
+        """#.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        return binary
+    }
+
+    /// The reviewer's path (#964): Stop, then a message whose launch fails,
+    /// then a retry that launches. The note is owed through the failure and
+    /// handed over once, with the retry; the person's words are never changed.
+    @Test func theStopNoteSurvivesAFailedLaunchAndIsDeliveredOnce() async throws {
+        try #require(Store.testing)
+        _ = NSApplication.shared
+        let agents = Agents()
+        let consent = ProviderConsent.shared
+        consent.grant("claude")
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("stop-note-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let log = root.appendingPathComponent("wire.log")
+        let session = Agents.Session(id: "retry-964-" + UUID().uuidString, cli: "claude", name: "Claude", prompt: "Send the link", state: .running)
+        let room = Store.file("agent/\(session.id)")
+        defer {
+            try? session.input?.close()
+            if session.process?.isRunning == true { session.process?.terminate() }
+            try? FileManager.default.removeItem(at: room)
+            try? FileManager.default.removeItem(at: root)
+            consent.revoke("claude")
+        }
+        agents.register(session)
+        session.binary = try stand(in: root).path
+        session.env = ["STUB_LOG": log.path]
+        func lines() -> [String] {
+            ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").compactMap {
+                try? JSONSerialization.jsonObject(with: Data($0.utf8), options: .fragmentsAllowed) as? String
+            }
+        }
+        /// run() admits the message and queues the real launch; this test
+        /// starts it by hand, so that one is refused first.
+        func admit(_ words: String) async {
+            let again = agents.run(prompt: words, cli: nil, access: "browser", resume: session.id)
+            #expect(again === session)
+            session.turnPermit.revoke()
+            for _ in 0..<5 { await Task.yield() }
+            session.state = .starting
+            session.result = ""
+            session.turnPermit = AgentTurnPermit()
+        }
+
+        #expect(agents.stop(session.id))
+        #expect(session.state == .stopped)
+
+        // A file where its folder goes: the launch throws (finish .failed).
+        try FileManager.default.createDirectory(at: room.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data().write(to: room)
+        await admit("first try")
+        #expect(session.afterStop)
+        agents.start(session, message: session.prompt)
+        #expect(session.state == .failed)
+        #expect(session.process == nil)
+        // Not spent by a launch that never handed it over.
+        #expect(session.afterStop)
+
+        try FileManager.default.removeItem(at: room)
+        await admit("second try")
+        #expect(session.afterStop, "a failed launch's note is not lost when the next message is admitted")
+        agents.start(session, message: session.prompt)
+        #expect(session.state == .running)
+        #expect(!session.afterStop)
+        let wrote = await {
+            let until = ProcessInfo.processInfo.systemUptime + 30
+            while lines().isEmpty, ProcessInfo.processInfo.systemUptime < until { try? await Task.sleep(for: .milliseconds(10)) }
+            return lines()
+        }()
+        #expect(wrote == [Agents.stoppedLine + "second try"])
+        #expect(wrote.joined().components(separatedBy: Agents.stoppedLine).count - 1 == 1)
+        // The person's own words, nothing else, in what is kept and shown.
+        #expect(session.prompt == "second try")
+        #expect(session.told.suffix(2) == ["first try", "second try"])
+        #expect(!session.told.contains { $0.contains(Agents.stoppedLine) })
+        #expect(session.items.filter { $0.kind == .asked }.allSatisfy { !$0.text.contains("stopped you") })
+    }
+
+    /// #964: a handoff waiting in a tab of another window goes with Stop,
+    /// which `tabs(of:)` (this window's alone) missed.
+    @Test func stopClearsAHandoffInAnotherWindow() {
+        _ = NSApplication.shared
+        let agents = Agents()
+        let first = Browser(windowID: UUID()), second = Browser(windowID: UUID())
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200), styleMask: .titled, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        BrowserWindows.shared.register(window, for: second)
+        let mine = Tab(bench: true), theirs = Tab(bench: true)
+        first.lay([mine])
+        second.lay([theirs])
+        agents.browser = first
+        defer {
+            mine.close(); theirs.close()
+            BrowserWindows.shared.forgetForTests(second)
+            window.close()
+            first.letGo(); second.letGo()
+        }
+        let session = Agents.Session(id: "windows-964", cli: "claude", name: "Claude", prompt: "Send the link", state: .running)
+        agents.register(session)
+        theirs.agent = session.id
+        theirs.handoff = "Sign in to the app"
+        #expect(agents.tabs(of: session).isEmpty)
+        #expect(agents.windowTabs.contains { $0 === theirs })
+        #expect(agents.stop(session.id))
+        #expect(theirs.handoff == nil)
     }
 
     @Test func aMessageAfterANormalTurnIsLeftAlone() {
