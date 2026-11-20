@@ -689,7 +689,8 @@ final class Agents: ObservableObject {
                     mail: session.mail || old?.mail == true ? true : nil, remoteTask: session.remoteTask,
                     source: Agents.source(of: session) ?? old?.source, routine: session.routine ?? old?.routine,
                     project: session.project, textOnly: session.cli == "gemini" ? session.textOnly : nil,
-                    effort: session.cli == "gemini" ? session.effort : nil)
+                    effort: session.cli == "gemini" ? session.effort : nil,
+                    afterStop: session.afterStop || session.state == .stopped ? true : nil)
             // A name, pin or read chosen on another device outlives the
             // session's own title and unread (R4).
             .keepingMetadata(from: old)
@@ -759,6 +760,8 @@ final class Agents: ObservableObject {
         session.result = chat.answer
         session.asked = chat.items.filter { $0.kind == .asked }.map(\.text)
         session.ended = chat.updated
+        // Stopped, or owed the note, when Yab quit: the next message says so (#964).
+        session.afterStop = chat.afterStop == true
         register(session)
         return session
     }
@@ -2036,6 +2039,7 @@ final class Agents: ObservableObject {
                     Shell.end(process, grace: 1)
                 }
             }
+            var queued = false
             if let input {
                 // Nor its stdin, once it has gone.
                 _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
@@ -2045,19 +2049,23 @@ final class Agents: ObservableObject {
                     let server = CodexServer { try? writer.write(contentsOf: $0) }
                     server.images = Store.file("chats/images")
                     session.server = server
+                    queued = true
                     server.open(thread: session.thread, fork: from, instructions: brief, cwd: process.currentDirectoryURL?.path ?? room.path)
                 } else if session.agent == .cursor {
                     let writer = input.fileHandleForWriting
                     let server = CursorServer { try? writer.write(contentsOf: $0) }
                     session.cursor = server
+                    queued = true
                     server.open(thread: session.thread, cwd: room.path,
                         mcp: session.textOnly ? [] : [["name": Mcp.name, "command": me, "args": mcpArgs(session), "env": []]], textOnly: session.textOnly)
                 }
                 send(session, session.agent == .cursor && session.thread == nil ? brief + "\n\n" + message : message)
             }
-            // Written to its stdin or the server above; a Codex exec has
-            // it in its arguments, handed over by the launch (#964).
-            delivered(session)
+            // Written to Claude Code's stdin above; a Codex exec has it in
+            // its arguments, handed over by the launch. Codex's and Cursor's
+            // servers only queue it until their thread opens: theirs is
+            // delivered on .ready (#964).
+            if !queued { delivered(session) }
             if !session.remembering {
                 session.state = .running
                 note(session, "\(session.name) is working")
@@ -3277,7 +3285,10 @@ final class Agents: ObservableObject {
     private func cursor(_ heard: [CursorServer.Heard], _ session: Session) {
         for event in heard {
             switch event {
-            case .ready(let thread): session.thread = thread
+            case .ready(let thread):
+                session.thread = thread
+                // The queued first message went out as the chat opened (#964).
+                delivered(session)
             case .delta(let id, let words, let thinking):
                 session.items.grow(id, by: words, kind: thinking ? .thinking : .message, at: Date())
                 if !thinking { session.result += words }
@@ -3593,6 +3604,8 @@ final class Agents: ObservableObject {
             switch event {
             case .ready(let thread):
                 session.thread = thread
+                // The queued first message went out as the thread opened (#964).
+                delivered(session)
             case .taken:
                 session.unread = max(0, session.unread - 1)
                 if session.unread == 0, session.turnFinished, session.server?.turn == nil {

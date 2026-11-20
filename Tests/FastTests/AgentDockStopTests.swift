@@ -220,8 +220,10 @@ struct AgentDockStopTests {
         agents.start(session, message: session.prompt)
         #expect(session.state == .failed)
         #expect(session.process == nil)
-        // Not spent by a launch that never handed it over.
+        // Not spent by a launch that never handed it over, and kept with
+        // the chat while it is owed.
         #expect(session.afterStop)
+        #expect(agents.chat(of: session).afterStop == true)
 
         try FileManager.default.removeItem(at: room)
         await admit("second try")
@@ -279,10 +281,141 @@ struct AgentDockStopTests {
         defer { consent.revoke("claude") }
         let session = Agents.Session(id: "done-964", cli: "claude", name: "Claude", prompt: "Hi", state: .done)
         agents.register(session)
+        #expect(agents.chat(of: session).afterStop == nil)
         let next = agents.run(prompt: "And then?", cli: nil, access: "browser", resume: session.id)
         defer { next.turnPermit.revoke(); next.state = .failed }
         #expect(session.prompt == "And then?")
         #expect(!session.afterStop)
         #expect(Agents.said(session.prompt, afterStop: session.afterStop) == "And then?")
+    }
+
+    /// #964: Stop, quit, reopen, follow up. `revive` brings an ordinary chat
+    /// back as `.done`, so the stop is kept with the chat.
+    @Test func aStoppedChatBroughtBackAfterARelaunchStillSaysSo() throws {
+        let consent = ProviderConsent.shared
+        consent.grant("claude")
+        defer { consent.revoke("claude") }
+        let before = Agents()
+        let session = Agents.Session(id: "relaunch-964-" + UUID().uuidString, cli: "claude", name: "Claude", prompt: "Send the link", state: .running)
+        defer { Chats.shared.remove(session.id) }
+        before.register(session)
+        #expect(before.stop(session.id))
+        // As the next launch reads it from disk.
+        let kept = try JSONDecoder().decode(Chat.self, from: JSONEncoder().encode(before.chat(of: session)))
+        #expect(kept.afterStop == true)
+        Chats.shared.keep(kept)
+
+        let after = Agents()
+        let back = try #require(after.revive(kept.id))
+        #expect(back.state == .done)
+        #expect(back.afterStop)
+        let next = after.run(prompt: "no, from the page I'm on", cli: nil, access: "browser", resume: kept.id)
+        defer { next.turnPermit.revoke(); next.state = .failed }
+        #expect(next === back)
+        #expect(next.prompt == "no, from the page I'm on")
+        #expect(Agents.said(next.prompt, afterStop: next.afterStop) == Agents.stoppedLine + "no, from the page I'm on")
+    }
+
+    /// A stand-in Codex app server. While `STUB_FAIL` exists it ends before
+    /// any thread opens; otherwise it opens one and logs each turn's words.
+    private func codexStand(in root: URL) throws -> (binary: URL, auth: URL) {
+        let auth = root.appendingPathComponent("account", isDirectory: true)
+        try FileManager.default.createDirectory(at: auth, withIntermediateDirectories: true)
+        // CodexProbe only needs a file to link. The stub never reads sign-in.
+        try Data("{}".utf8).write(to: auth.appendingPathComponent("auth.json"))
+        let binary = root.appendingPathComponent("codex-stub")
+        try #"""
+        #!/usr/bin/python3
+        import json, os, sys
+
+        def emit(message):
+            print(json.dumps(message), flush=True)
+
+        for line in sys.stdin:
+            message = json.loads(line)
+            method = message.get('method')
+            if method == 'initialize':
+                emit({'id': message['id'], 'result': {}})
+            elif method in ('thread/unarchive', 'thread/start', 'thread/resume', 'thread/fork'):
+                if os.path.exists(os.environ['STUB_FAIL']):
+                    sys.exit(1)
+                emit({'id': message['id'], 'result': {'thread': {'id': 'stub-thread'}}})
+            elif method == 'turn/start':
+                with open(os.environ['STUB_LOG'], 'a') as output:
+                    output.write(json.dumps(message['params']['input'][0]['text']) + '\n')
+                turn = 'turn-' + str(message['id'])
+                emit({'id': message['id'], 'result': {'turn': {'id': turn}}})
+                emit({'method': 'turn/completed', 'params': {'threadId': 'stub-thread',
+                     'turn': {'id': turn, 'status': 'completed'}}})
+            elif 'id' in message:
+                emit({'id': message['id'], 'result': {}})
+        """#.write(to: binary, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: binary.path)
+        return (binary, auth)
+    }
+
+    /// The reviewer's second path (#964): Codex's server only queues the
+    /// first message until its thread opens. One that ends before then has
+    /// not handed the note over, so the next launch still owes it.
+    @Test func aCodexServerThatEndsBeforeItsThreadOpensKeepsTheNote() async throws {
+        try #require(Store.testing)
+        let agents = Agents()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("stop-note-codex-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let (binary, auth) = try codexStand(in: root)
+        let log = root.appendingPathComponent("wire.log")
+        let fail = root.appendingPathComponent("fail")
+        let suite = "stop-note-consent-" + root.lastPathComponent
+        let consent = ProviderConsent(settings: UserDefaults(suiteName: suite)!, history: [])
+        consent.grant("codex")
+        let session = Agents.Session(id: "codex-964-" + UUID().uuidString, cli: "codex", name: "Codex", prompt: "first try", state: .starting)
+        session.providerPermit = consent.permit("codex")
+        session.quiet = true
+        session.textOnly = true
+        session.full = true
+        session.folder = root.path
+        session.binary = binary.path
+        session.env = ["CODEX_HOME": auth.path, "STUB_LOG": log.path, "STUB_FAIL": fail.path]
+        Agents.codexServes[binary.path] = true
+        defer {
+            try? session.input?.close()
+            if session.process?.isRunning == true { session.process?.terminate() }
+            Agents.codexServes.removeValue(forKey: binary.path)
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: CodexProbe.home(root: Store.file("codex"), source: auth))
+            try? FileManager.default.removeItem(at: root)
+        }
+        func lines() -> [String] {
+            ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").compactMap {
+                try? JSONSerialization.jsonObject(with: Data($0.utf8), options: .fragmentsAllowed) as? String
+            }
+        }
+        func waitUntil(_ condition: () -> Bool) async -> Bool {
+            let until = ProcessInfo.processInfo.systemUptime + 30
+            while !condition(), ProcessInfo.processInfo.systemUptime < until { try? await Task.sleep(for: .milliseconds(10)) }
+            return condition()
+        }
+        // As run() leaves it after a Stop.
+        session.afterStop = true
+
+        try Data().write(to: fail)
+        agents.start(session, message: "first try")
+        // Queued for a thread that is not open yet: not handed over.
+        #expect(session.afterStop)
+        let ended = await waitUntil { session.state == .failed && session.process == nil }
+        try #require(ended)
+        #expect(lines().isEmpty)
+        #expect(session.afterStop, "a server that never opened its thread did not spend the note")
+
+        try FileManager.default.removeItem(at: fail)
+        session.turnPermit = AgentTurnPermit()
+        session.state = .starting
+        session.result = ""
+        session.ended = nil
+        agents.start(session, message: "second try")
+        let answered = await waitUntil { !lines().isEmpty }
+        try #require(answered)
+        #expect(lines() == [Agents.stoppedLine + "second try"])
+        #expect(!session.afterStop)
     }
 }
