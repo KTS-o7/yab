@@ -1215,25 +1215,44 @@ final class Folders: ObservableObject {
         let keepable = !shut && (held.keepable || (task && held.bench && held.pin == nil && !held.shy && !held.isBlank))
             && !(task && Agents.shared.sealed(held))
 
-        // Over one of your folders, shut, as the rows are drawn now: into
-        // it, and nothing moves, so the folder stays under the hand.
+        // Over one of your folders, shut, as the rows are drawn now: its
+        // middle takes the tab in, and nothing moves, so the folder stays
+        // under the hand. Its top and bottom put it just above or below the
+        // folder's run, as Arc's line between two folders, so a tab can go
+        // between two shut ones (#737), as a carried folder can (#1981).
+        var only: (index: Int, nest: UUID?)?
         if keepable, folders.contains(where: { folder in folder.nest.map { (!$0.open || folder.members.isEmpty) && $0 !== held.nest } ?? false }) {
             let shown = current ?? Landing(index: from, slot: now, kept: held.kept, nest: held.nest?.id)
             var order = rest
             order.insert(held, at: min(max(0, shown.index), order.count))
             let heads = slots(order, out: shown.out ? held.id : nil, joined: joined, held: held.id, as: shown.guise).folders
+            let kept = rest.prefix(while: \.kept)
             for folder in folders {
                 guard let nest = folder.nest, !nest.open || folder.members.isEmpty, nest !== held.nest, let head = heads[folder.id] else { continue }
-                // Anywhere over its row: the rows around it would otherwise
-                // make way at its middle, and it would step away from under
-                // the hand before the hand was in. Once in, a little more
-                // room to stay in than to come in.
-                let reach = shown.into == nest.id ? 0.6 : 0.5
-                if want >= Double(head) - reach, want <= Double(head) + reach {
+                let off = want - Double(head)
+                // An empty one, or one with no run among the kept, has no
+                // shut run to be above or below: anywhere over its row takes
+                // the tab in, else the rows around it would make way at its
+                // middle and it would step away from under the hand before
+                // the hand was in. Once in, a little more room to stay in
+                // than to come in.
+                guard !nest.open, let start = kept.firstIndex(where: { $0.nest?.within(nest) == true }),
+                      let end = kept.lastIndex(where: { $0.nest?.within(nest) == true }) else {
+                    if abs(off) <= (shown.into == nest.id ? 0.6 : 0.5) {
+                        var into = shown
+                        into.into = nest.id
+                        return into
+                    }
+                    continue
+                }
+                guard abs(off) <= 0.5 else { continue }
+                if abs(off) <= (shown.into == nest.id ? 0.3 : 0.25) {
                     var into = shown
                     into.into = nest.id
                     return into
                 }
+                only = (off < 0 ? start : end + 1, nest.parent?.id)
+                break
             }
         }
 
@@ -1293,6 +1312,12 @@ final class Folders: ObservableObject {
         }
         if shut, held.kept {
             options.append(Landing(index: from, slot: 0, kept: true, nest: held.nest?.id))
+        }
+        // Over a shut folder's top or bottom: only the place just above or
+        // below its run, among the folders it is in.
+        if let only {
+            let there = options.filter { $0.kept && $0.index == only.index && $0.nest == only.nest }
+            if !there.isEmpty { options = there }
         }
 
         // Where the held one would be drawn at each place depends only on
