@@ -1261,8 +1261,9 @@ final class Folders: ObservableObject {
         let yours = rest.firstIndex { places[$0.id].map { !Nest.isKey($0.folder) } ?? false } ?? rest.count
         let keptIn = rest.prefix(while: \.kept).count
         // Only the places the hand could be near: every folder row and every
-        // tucked-away tab can put a slot one further from its index.
-        let reach = 3 + folders.count + tucked
+        // tucked-away tab can put a slot one further from its index, and
+        // so can a pair drawn as one row.
+        let reach = 3 + folders.count + tucked + (joined ? browser?.pairs.count ?? 0 : 0)
         // A hand can travel well past the final row. Clamp both insertion
         // bounds before converting to Int or indexing the remaining tabs.
         let near = want.rounded()
@@ -1314,10 +1315,13 @@ final class Folders: ObservableObject {
             options.append(Landing(index: from, slot: 0, kept: true, nest: held.nest?.id))
         }
         // Over a shut folder's top or bottom: only the place just above or
-        // below its run, among the folders it is in.
+        // below its run, among the folders it is in. Made here, not looked
+        // for among the near ones: a pair drawn as one row puts the run's
+        // index further down than the slots the search goes by, and with
+        // ten pairs above, the place was out of reach and the tab went
+        // among the pairs.
         if let only {
-            let there = options.filter { $0.kept && $0.index == only.index && $0.nest == only.nest }
-            if !there.isEmpty { options = there }
+            options = [Landing(index: only.index, slot: 0, out: task, kept: true, nest: only.nest)]
         }
 
         // Where the held one would be drawn at each place depends only on
